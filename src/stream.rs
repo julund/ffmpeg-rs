@@ -96,16 +96,23 @@ pub fn run(args: &[String]) -> ExitCode {
 // What becomes of an input stream.
 enum Lane {
     Skip,
-    Copy { output: usize, time_base: Rational },
+    Copy {
+        output: usize,
+        time_base: Rational,
+        last: Option<i64>,
+    },
     Video(Box<VideoLane>),
     Audio(Box<AudioLane>),
 }
 
+// Each lane keeps the time of the last packet it wrote (last), in its
+// output's time base.
 struct VideoLane {
     output: usize,
     decoder: decoder::Video,
     graph: filter::Graph,
     encoder: encoder::Video,
+    last: Option<i64>,
 }
 
 struct AudioLane {
@@ -113,6 +120,12 @@ struct AudioLane {
     decoder: decoder::Audio,
     graph: filter::Graph,
     encoder: encoder::Audio,
+    last: Option<i64>,
+    // The input stream's time base, a second in it, and the time the next
+    // decoded frame starts at, in it.
+    time_base: Rational,
+    second: i64,
+    next: Option<i64>,
 }
 
 fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
@@ -169,6 +182,7 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
                 Lane::Copy {
                     output: added.index(),
                     time_base: stream.time_base(),
+                    last: None,
                 }
             }
             (Way::Transcode, media::Type::Video) => {
@@ -213,11 +227,12 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
             Lane::Copy {
                 output: index,
                 time_base,
+                last,
             } => {
                 packet.rescale_ts(*time_base, time_bases[*index]);
                 packet.set_position(-1);
                 packet.set_stream(*index);
-                packet.write_interleaved(&mut output)?;
+                write_packet(&mut packet, last, &mut output)?;
             }
             Lane::Video(lane) => {
                 // A packet that can't be decoded is passed over, as a player
@@ -364,6 +379,7 @@ fn video_lane(
         graph,
         decoder,
         encoder,
+        last: None,
     })
 }
 
@@ -444,6 +460,10 @@ fn audio_lane(
         decoder,
         graph,
         encoder,
+        last: None,
+        second: 1.rescale(Rational(1, 1), time_base),
+        time_base,
+        next: None,
     })
 }
 
@@ -458,6 +478,23 @@ fn layout_mask(decoder: &decoder::Audio) -> String {
     format!("0x{:x}", layout.bits())
 }
 
+// Writes a packet unless its time is not after the last one's of its stream,
+// which the muxer would refuse, ending the whole stream over one packet: a
+// DVD's sound times only some of its frames, and its times can overlap.
+fn write_packet(
+    packet: &mut Packet,
+    last: &mut Option<i64>,
+    output: &mut format::context::Output,
+) -> Result<(), ffmpeg_next::Error> {
+    if let (Some(dts), Some(before)) = (packet.dts(), *last) {
+        if dts <= before {
+            return Ok(());
+        }
+    }
+    *last = packet.dts().or(*last);
+    packet.write_interleaved(output)
+}
+
 // Writes what an encoder has made.
 fn write(
     encoder: &mut encoder::encoder::Encoder,
@@ -465,12 +502,13 @@ fn write(
     index: usize,
     to: Rational,
     output: &mut format::context::Output,
+    last: &mut Option<i64>,
 ) -> Result<(), ffmpeg_next::Error> {
     let mut packet = Packet::empty();
     while encoder.receive_packet(&mut packet).is_ok() {
         packet.set_stream(index);
         packet.rescale_ts(from, to);
-        packet.write_interleaved(output)?;
+        write_packet(&mut packet, last, output)?;
     }
     Ok(())
 }
@@ -507,7 +545,14 @@ impl VideoLane {
             }
             self.encoder.send_frame(&shown)?;
             let from = self.encoder.time_base();
-            write(&mut self.encoder, from, self.output, to, output)?;
+            write(
+                &mut self.encoder,
+                from,
+                self.output,
+                to,
+                output,
+                &mut self.last,
+            )?;
         }
         Ok(())
     }
@@ -523,11 +568,35 @@ impl VideoLane {
         self.pull(output, to)?;
         self.encoder.send_eof()?;
         let from = self.encoder.time_base();
-        write(&mut self.encoder, from, self.output, to, output)
+        write(
+            &mut self.encoder,
+            from,
+            self.output,
+            to,
+            output,
+            &mut self.last,
+        )
     }
 }
 
 impl AudioLane {
+    // Each frame's time, from the first's on by how many samples came before
+    // it, rather than the times the decoder gives: a DVD's AC-3 has some of
+    // its frames timed and the rest not, which comes out as times that
+    // overlap. A jump of more than a second, as after a gap in the file, is
+    // taken as it is.
+    fn time_of(&mut self, decoded: &frame::Audio) -> Option<i64> {
+        let said = decoded.timestamp();
+        let pts = match (self.next, said) {
+            (Some(next), Some(said)) if (said - next).abs() <= self.second => next,
+            (Some(next), None) => next,
+            (_, said) => said?,
+        };
+        let samples = i64::try_from(decoded.samples()).unwrap_or(0);
+        self.next = Some(pts + samples.rescale(Rational(1, decoded.rate() as i32), self.time_base));
+        Some(pts)
+    }
+
     fn drain(
         &mut self,
         output: &mut format::context::Output,
@@ -535,7 +604,7 @@ impl AudioLane {
     ) -> Result<(), ffmpeg_next::Error> {
         let mut decoded = frame::Audio::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            let timestamp = decoded.timestamp();
+            let timestamp = self.time_of(&decoded);
             decoded.set_pts(timestamp);
             if let Some(mut source) = self.graph.get("in") {
                 source.source().add(&decoded)?;
@@ -557,7 +626,14 @@ impl AudioLane {
             }
             self.encoder.send_frame(&sound)?;
             let from = self.encoder.time_base();
-            write(&mut self.encoder, from, self.output, to, output)?;
+            write(
+                &mut self.encoder,
+                from,
+                self.output,
+                to,
+                output,
+                &mut self.last,
+            )?;
         }
         Ok(())
     }
@@ -573,6 +649,13 @@ impl AudioLane {
         self.pull(output, to)?;
         self.encoder.send_eof()?;
         let from = self.encoder.time_base();
-        write(&mut self.encoder, from, self.output, to, output)
+        write(
+            &mut self.encoder,
+            from,
+            self.output,
+            to,
+            output,
+            &mut self.last,
+        )
     }
 }
