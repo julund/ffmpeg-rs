@@ -14,8 +14,10 @@
 use std::process::ExitCode;
 
 use ffmpeg_next::{
-    Dictionary, Packet, Rational, codec, decoder, encoder, filter, format, frame, media,
+    Dictionary, Packet, Rational, Rescale, codec, decoder, encoder, filter, format, frame, media,
 };
+
+const MICROSECONDS: Rational = Rational(1, 1_000_000);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Way {
@@ -125,11 +127,26 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
         .map(|stream| stream.index());
 
     // Fragments from the first keyframe on, with no index at the end to
-    // wait for, and times from zero wherever it starts.
+    // wait for. Their times are the file's own, from its start, wherever the
+    // stream starts in it, so that a stream from a time is where a player
+    // has it: only a time before the start, as a B-frame's at it can be, is
+    // moved up.
     let mut muxing = Dictionary::new();
-    muxing.set("movflags", "frag_keyframe+empty_moov+default_base_moof");
-    muxing.set("avoid_negative_ts", "make_zero");
+    // frag_discont has a fragment's time be its first frame's, which the
+    // muxer would otherwise take to be zero.
+    muxing.set(
+        "movflags",
+        "frag_keyframe+empty_moov+default_base_moof+frag_discont",
+    );
+    muxing.set("avoid_negative_ts", "make_non_negative");
     let mut output = format::output_as("pipe:1", "mp4")?;
+    // Where the file's own times start, as a camcorder's stream's don't at
+    // zero; in microseconds.
+    // SAFETY: the context is the input's, open.
+    let origin = match unsafe { (*input.as_ptr()).start_time } {
+        ffmpeg_next::ffi::AV_NOPTS_VALUE => 0,
+        start => start,
+    };
 
     let mut lanes: Vec<Lane> = Vec::new();
     for stream in input.streams() {
@@ -166,9 +183,14 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
     }
 
     if options.start_ms > 0 {
-        let target = options.start_ms * i64::from(ffmpeg_next::ffi::AV_TIME_BASE) / 1000;
+        let target = options.start_ms * i64::from(ffmpeg_next::ffi::AV_TIME_BASE) / 1000 + origin;
         input.seek(target, ..target)?;
     }
+    // The start in each stream's own time base, which its times are taken from.
+    let shifts: Vec<i64> = input
+        .streams()
+        .map(|stream| origin.rescale(MICROSECONDS, stream.time_base()))
+        .collect();
     output.write_header_with(muxing)?;
     let time_bases: Vec<Rational> = (0..output.nb_streams() as usize)
         .map(|index| {
@@ -183,6 +205,9 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
         let Some(lane) = lanes.get_mut(stream.index()) else {
             continue;
         };
+        let shift = shifts.get(stream.index()).copied().unwrap_or(0);
+        packet.set_pts(packet.pts().map(|pts| pts - shift));
+        packet.set_dts(packet.dts().map(|dts| dts - shift));
         match lane {
             Lane::Skip => {}
             Lane::Copy {

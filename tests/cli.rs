@@ -198,6 +198,68 @@ fn a_picture_is_made_again_as_vp9_where_asked() {
     assert!(!has(&output.stdout, "Opus"));
 }
 
+// Where the first fragment of the first track starts, in seconds: its tfdt
+// over its mdhd's timescale.
+fn first_fragment_at(bytes: &[u8]) -> f64 {
+    let find = |name: &str| {
+        bytes
+            .windows(4)
+            .position(|window| window == name.as_bytes())
+            .expect(name)
+    };
+    let be = |at: usize, length: usize| {
+        bytes[at..at + length]
+            .iter()
+            .fold(0u64, |value, &byte| value << 8 | u64::from(byte))
+    };
+    // mdhd: version and flags, two dates of four bytes (version 0), then the
+    // timescale; tfdt: version and flags, then the time, of eight bytes in
+    // version 1.
+    let mdhd = find("mdhd") + 4;
+    let timescale = be(mdhd + 12, 4);
+    let tfdt = find("tfdt") + 4;
+    let time = if bytes[tfdt] == 1 {
+        be(tfdt + 4, 8)
+    } else {
+        be(tfdt + 4, 4)
+    };
+    time as f64 / timescale as f64
+}
+
+#[test]
+fn a_stream_has_the_files_own_times_from_where_it_starts() {
+    // A transport stream's times start well after zero; the stream's don't.
+    let whole = stream(&[
+        "--input",
+        &fixture("h264.mts"),
+        "--video",
+        "copy",
+        "--audio",
+        "none",
+    ]);
+    assert!(whole.status.success());
+    assert!(first_fragment_at(&whole.stdout) < 0.1);
+    // From half a second in, from the keyframe before it, where it is in the
+    // file: this one's are twelve frames apart, at 0.48 s. (Not the DVD's: a
+    // program stream has no index, and in one of a second ffmpeg's seek goes
+    // past it.)
+    let later = stream(&[
+        "--input",
+        &fixture("mpeg4.avi"),
+        "--video",
+        "transcode",
+        "--audio",
+        "none",
+        "--encoder",
+        "vp9",
+        "--start",
+        "500",
+    ]);
+    assert!(later.status.success());
+    let at = first_fragment_at(&later.stdout);
+    assert!((0.3..=0.55).contains(&at), "it starts at {at}");
+}
+
 #[test]
 fn a_stream_of_what_isnt_there_fails() {
     let output = stream(&["--input", &fixture("missing.avi")]);
