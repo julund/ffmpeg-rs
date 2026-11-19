@@ -1,0 +1,93 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"title": "ffmpeg-rs serve",
+	"description": "A request is a JSON line on stdin; each but stop has a reply line on stdout, in the order they came. A frame's reply is followed by its PNG, of as many bytes as it says.",
+	"$defs": {
+		"request": {
+			"oneOf": [
+				{
+					"type": "object",
+					"properties": {
+						"op": { "const": "caps" },
+						"id": { "type": "integer", "minimum": 0 }
+					},
+					"required": ["op", "id"],
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"properties": {
+						"op": { "const": "frame" },
+						"id": { "type": "integer", "minimum": 0 },
+						"path": { "type": "string" },
+						"at": { "type": "number", "minimum": 0, "maximum": 1 },
+						"size": { "type": "integer", "minimum": 1 }
+					},
+					"required": ["op", "id", "path", "at", "size"],
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"properties": { "op": { "const": "stop" } },
+					"required": ["op"],
+					"additionalProperties": false
+				}
+			]
+		},
+		"failure": {
+			"type": "object",
+			"properties": {
+				"code": {
+					"enum": ["request", "open", "no-video", "decoder", "decode", "filter", "encode"]
+				},
+				"message": { "type": "string" }
+			},
+			"required": ["code", "message"],
+			"additionalProperties": false
+		},
+		"caps": {
+			"type": "object",
+			"properties": {
+				"decoders": { "type": "array", "items": { "type": "string" } },
+				"encoders": { "type": "array", "items": { "type": "string" } },
+				"demuxers": { "type": "array", "items": { "type": "string" } },
+				"muxers": { "type": "array", "items": { "type": "string" } }
+			},
+			"required": ["decoders", "encoders", "demuxers", "muxers"],
+			"additionalProperties": false
+		},
+		"frame": {
+			"type": "object",
+			"properties": {
+				"width": { "type": "integer" },
+				"height": { "type": "integer" },
+				"bytes": { "type": "integer" }
+			},
+			"required": ["width", "height", "bytes"],
+			"additionalProperties": false
+		},
+		"reply": {
+			"oneOf": [
+				{
+					"type": "object",
+					"properties": {
+						"id": { "type": "integer" },
+						"ok": { "oneOf": [{ "$ref": "#/$defs/caps" }, { "$ref": "#/$defs/frame" }] }
+					},
+					"required": ["id", "ok"],
+					"additionalProperties": false
+				},
+				{
+					"type": "object",
+					"description": "A request that couldn't be read has no id.",
+					"properties": {
+						"id": { "type": "integer" },
+						"error": { "$ref": "#/$defs/failure" }
+					},
+					"required": ["error"],
+					"additionalProperties": false
+				}
+			]
+		}
+	}
+}

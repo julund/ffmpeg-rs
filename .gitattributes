@@ -1,0 +1,2 @@
+# LF everywhere, on Windows too: build.sh runs in bash, which a CR breaks.
+* text=auto eol=lf

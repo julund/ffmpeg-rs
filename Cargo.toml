@@ -1,0 +1,26 @@
+[package]
+name = "ffmpeg-rs"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+description = "A small program over a trimmed, LGPL ffmpeg: what it decodes, a frame of a video, and a video remuxed or transcoded for a webview to play"
+publish = false
+
+[dependencies]
+# Linked statically against the ffmpeg build.sh makes, found by pkg-config.
+ffmpeg-next = { version = "9.1", default-features = false, features = [
+  "codec",
+  "filter",
+  "format",
+  "software-scaling",
+  "software-resampling",
+  "static",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
