@@ -58,8 +58,8 @@ jobs:
         with:
           name: free
           path: |
-            target/x86_64-pc-windows-gnu/release/ffmpeg-rs.exe
-            target/x86_64-pc-windows-gnu/release/NOTICES.txt
+            target/release/ffmpeg-rs.exe
+            target/release/NOTICES.txt
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

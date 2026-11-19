@@ -165,7 +165,12 @@ cargo build --release --locked --target "$TARGET"
 # Where cargo puts what it builds, which a configuration may have elsewhere.
 OUT=$(cargo metadata --format-version 1 --no-deps |
 	sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | sed 's/\\\\/\//g')
-RELEASE=$OUT/$TARGET/release
+# Cargo puts a build for a target it's told of under the target's name; the
+# program and its notices go to target/release/, as a program built for the
+# machine's own target would be, where nothing has to know which that is.
+RELEASE=$OUT/release
+mkdir -p "$RELEASE"
+cp "$OUT/$TARGET/release/ffmpeg-rs.exe" "$RELEASE/ffmpeg-rs.exe"
 
 # The licences of what's built into the program, which go wherever it does:
 # its own, ffmpeg's and the libraries' it links, from their sources.
