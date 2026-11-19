@@ -1,9 +1,9 @@
 [package]
 name = "ffmpeg-rs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
-description = "A small program over a trimmed, LGPL ffmpeg: what it decodes, a frame of a video, and a video remuxed or transcoded for a webview to play"
+description = "A small program over a trimmed, LGPL ffmpeg: what it decodes, a frame of a video, a video remuxed or transcoded for a webview to play, and one made into a file to keep"
 publish = false
 
 [dependencies]

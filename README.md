@@ -1,10 +1,11 @@
 # ffmpeg-rs
 
-A small program over a trimmed ffmpeg, built LGPL alone, for an app to start as a process of its own. It does three things:
+A small program over a trimmed ffmpeg, built LGPL alone, for an app to start as a process of its own. It does four things:
 
 - **caps**: what this build decodes, encodes, reads and writes, from ffmpeg's own registry.
 - **frame**: a frame of a video as a PNG, from some way through it, deinterlaced where it's interlaced, with square pixels, scaled down to fit.
 - **stream**: a video into a fragmented MP4 on stdout that a webview plays as it comes, each of its picture and sound copied as it is or made again: the picture as H.264 by Windows' own encoder where the machine has one and as VP9 where it hasn't, the sound as Opus.
+- **render**: the same into an MP4 file to keep, its index first: the picture fitted inside a largest size and made at a quality, by the machine's hardware H.264, then Windows' software H.264, then VP9, and saying how far it is as it goes.
 
 It's written for a desktop photo and video library, to play and show the videos a webview can't: camcorders' DV and AVCHD, DVDs, Xvid and DivX, old phones' 3GP, Flash, Windows Media and the like.
 
@@ -13,9 +14,14 @@ It's written for a desktop photo and video library, to play and show the videos 
 ```
 ffmpeg-rs serve       stays open: JSON lines in, JSON lines out
 ffmpeg-rs stream --input <path> [--start <ms>] [--video copy|transcode] [--audio copy|transcode|none] [--encoder auto|h264|vp9]
+ffmpeg-rs render --input <path> --output <path> [--max-size <pixels>] [--quality 1-100] [--video copy|transcode] [--audio copy|transcode|none] [--encoder auto|h264|vp9]
 ffmpeg-rs --protocol  the JSON Schema of serve's requests and replies (protocol.json)
 ffmpeg-rs --version   this program's version, ffmpeg's, and the line ffmpeg was configured with
 ```
+
+`render` writes `{"at":<ms>}` on stdout as each second of the video is made, from its start. Its quality is 75 where it isn't said; it's Media Foundation's for H.264 and a constant quality for VP9 (75 is crf 27). A file it leaves after it failed or was killed is half made, so its caller writes it under a name of its own and renames it once it's done.
+
+On a 10-second 1080p clip at 30 frames with its sound, on an i7-4790K: H.264 by the machine's encoder in 2.5 s and VP9 in 3.2 s; Windows' software H.264 took 1.6 s by ffmpeg's own command, and libvpx's good setting 13.2 s for a file 13 % smaller.
 
 `serve` takes `{"op":"caps","id":1}`, `{"op":"frame","id":2,"path":"…","at":0.1,"size":512}` and `{"op":"stop"}`, and answers each but `stop` with `{"id":…,"ok":…}` or `{"id":…,"error":{"code":…,"message":…}}`, in the order they came; a frame's answer is followed by its PNG, of as many bytes as it says.
 

@@ -266,3 +266,140 @@ fn a_stream_of_what_isnt_there_fails() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+fn render(args: &[&str]) -> Output {
+    Command::new(PROGRAM)
+        .arg("render")
+        .args(args)
+        .output()
+        .expect("the program runs")
+}
+
+// A file of the test's own, in the system's temp folder, gone first.
+fn scratch(name: &str) -> String {
+    let path = std::env::temp_dir().join(format!("ffmpeg-rs-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path.to_string_lossy().into_owned()
+}
+
+// The width and height an MP4's sample entry of that type says, which come
+// after its six reserved bytes, its data reference and sixteen bytes more.
+// It's looked for in the sample descriptions, as the file's brands can have
+// the same name.
+fn picture_size(bytes: &[u8], entry: &str) -> Option<(u16, u16)> {
+    let stsd = bytes.windows(4).position(|window| window == b"stsd")?;
+    let at = stsd
+        + bytes[stsd..]
+            .windows(4)
+            .position(|window| window == entry.as_bytes())?
+        + 28;
+    let field = |from: usize| {
+        Some(u16::from_be_bytes([
+            *bytes.get(from)?,
+            *bytes.get(from + 1)?,
+        ]))
+    };
+    Some((field(at)?, field(at + 2)?))
+}
+
+#[test]
+fn a_rendition_is_square_fitted_and_kept_in_a_file() {
+    for encoder in ["auto", "vp9"] {
+        let path = scratch(&format!("dvd-{encoder}.mp4"));
+        let output = render(&[
+            "--input",
+            &fixture("interlaced.vob"),
+            "--output",
+            &path,
+            "--video",
+            "transcode",
+            "--audio",
+            "transcode",
+            "--encoder",
+            encoder,
+            "--max-size",
+            "384",
+            "--quality",
+            "60",
+        ]);
+        assert!(
+            output.status.success(),
+            "{encoder}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&path).expect("the file is there");
+        // Its index first, then what it indexes.
+        let moov = bytes.windows(4).position(|window| window == b"moov");
+        let mdat = bytes.windows(4).position(|window| window == b"mdat");
+        assert!(moov < mdat, "{encoder}: moov after mdat");
+        assert!(!has(&bytes, "moof") && has(&bytes, "Opus"));
+        // H.264 by the machine's encoder, where it has one; VP9 where not.
+        let entry = if encoder == "vp9" || !has(&bytes, "avc1") {
+            "vp09"
+        } else {
+            "avc1"
+        };
+        // 720 by 576 of pixels 16:15 wide is 768 by 576, fitted to 384.
+        assert_eq!(picture_size(&bytes, entry), Some((384, 288)), "{encoder}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn a_rendition_says_how_far_it_is() {
+    let path = scratch("progress.mp4");
+    let output = render(&[
+        "--input",
+        &fixture("mpeg4.avi"),
+        "--output",
+        &path,
+        "--video",
+        "copy",
+        "--audio",
+        "none",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON"))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .all(|line| line["at"].as_u64().is_some_and(|at| at % 1000 == 0)),
+        "{lines:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn render_and_stream_keep_to_their_own_options() {
+    let to = scratch("unasked.mp4");
+    let without = render(&["--input", &fixture("mpeg4.avi")]);
+    assert!(!without.status.success());
+    let started = render(&[
+        "--input",
+        &fixture("mpeg4.avi"),
+        "--output",
+        &to,
+        "--start",
+        "500",
+    ]);
+    assert!(!started.status.success());
+    let streamed = stream(&["--input", &fixture("mpeg4.avi"), "--output", &to]);
+    assert!(!streamed.status.success() && streamed.stdout.is_empty());
+    let small = render(&[
+        "--input",
+        &fixture("mpeg4.avi"),
+        "--output",
+        &to,
+        "--max-size",
+        "8",
+    ]);
+    assert!(!small.status.success());
+    assert!(!std::path::Path::new(&to).exists());
+}

@@ -5,6 +5,7 @@
 //!
 //!   ffmpeg-rs serve       stays open; JSON lines in, JSON lines out (protocol.json)
 //!   ffmpeg-rs stream ...  one video to stdout, until it ends or is killed
+//!   ffmpeg-rs render ...  one video into an MP4 file to keep
 //!   ffmpeg-rs --protocol  the JSON Schema of what serve takes and gives
 //!   ffmpeg-rs --version   this program's version and ffmpeg's, and how ffmpeg was built
 
@@ -26,6 +27,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("serve") => protocol::serve(),
         Some("stream") => stream::run(&args[1..]),
+        Some("render") => stream::render(&args[1..]),
         Some("--protocol") => {
             print!("{}", protocol::SCHEMA);
             ExitCode::SUCCESS
@@ -38,7 +40,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("Usage: ffmpeg-rs serve | stream ... | --protocol | --version");
+            eprintln!("Usage: ffmpeg-rs serve | stream ... | render ... | --protocol | --version");
             ExitCode::from(2)
         }
     }

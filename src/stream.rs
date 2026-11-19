@@ -1,16 +1,28 @@
 //! One video into a fragmented MP4 on stdout, which a webview plays as it
 //! comes: each of its first picture and first sound copied as it is, or
-//! made again, from a time on, until it ends or the program is killed.
+//! made again, from a time on, until it ends or the program is killed. Or,
+//! with render, into an MP4 file to keep.
 //!
 //!   ffmpeg-rs stream --input <path> [--start <ms>] [--video copy|transcode]
 //!     [--audio copy|transcode|none] [--encoder auto|h264|vp9]
+//!   ffmpeg-rs render --input <path> --output <path> [--max-size <pixels>]
+//!     [--quality 1-100] and stream's --video, --audio and --encoder
 //!
 //! A picture is made again as H.264 by Windows' own encoder where the
 //! machine has one, and as VP9 where it hasn't, deinterlaced and with square
 //! pixels; a sound as Opus. All of them play in an MP4. --encoder vp9 makes
 //! it VP9 where there is a hardware encoder too, as a machine without one
 //! would, and --encoder h264 fails where there's none.
+//!
+//! render makes it to keep rather than to watch at once: H.264 by Windows'
+//! software encoder where there's no hardware one, before VP9, which it makes
+//! a little smaller than stream's, at the quality asked. The picture fits inside
+//! --max-size, never made larger, at --quality (75 where it isn't said). Its
+//! file has its index first, to play as it's downloaded. It writes a line on
+//! stdout as each second of the video is made, {"at":<ms>}, from the file's
+//! start; a file that's left by one that failed or was killed is half made.
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use ffmpeg_next::{
@@ -36,19 +48,26 @@ enum Encoder {
 
 struct Options {
     input: String,
+    // A file to keep, rather than a stream on stdout.
+    output: Option<String>,
     start_ms: i64,
     video: Way,
     audio: Way,
     encoder: Encoder,
+    max_size: Option<u32>,
+    quality: u8,
 }
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
         input: String::new(),
+        output: None,
         start_ms: 0,
         video: Way::Copy,
         audio: Way::Copy,
         encoder: Encoder::Auto,
+        max_size: None,
+        quality: 75,
     };
     let mut args = args.iter();
     while let Some(flag) = args.next() {
@@ -61,7 +80,24 @@ fn options(args: &[String]) -> Result<Options, String> {
         };
         match flag.as_str() {
             "--input" => options.input = value.clone(),
+            "--output" => options.output = Some(value.clone()),
             "--start" => options.start_ms = value.parse().map_err(|_| "--start is milliseconds")?,
+            "--max-size" => {
+                options.max_size = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|size| *size >= 16)
+                        .ok_or("--max-size is 16 pixels or more")?,
+                )
+            }
+            "--quality" => {
+                options.quality = value
+                    .parse()
+                    .ok()
+                    .filter(|quality| (1..=100).contains(quality))
+                    .ok_or("--quality is 1 to 100")?
+            }
             "--video" => options.video = way(value)?,
             "--audio" => options.audio = way(value)?,
             "--encoder" => {
@@ -82,8 +118,27 @@ fn options(args: &[String]) -> Result<Options, String> {
 }
 
 pub fn run(args: &[String]) -> ExitCode {
-    let result =
-        options(args).and_then(|options| stream(&options).map_err(|error| error.to_string()));
+    finish(options(args).and_then(|options| {
+        if options.output.is_some() || options.max_size.is_some() {
+            return Err("--output and --max-size are render's".into());
+        }
+        stream(&options).map_err(|error| error.to_string())
+    }))
+}
+
+pub fn render(args: &[String]) -> ExitCode {
+    finish(options(args).and_then(|options| {
+        if options.output.is_none() {
+            return Err("--output is needed".into());
+        }
+        if options.start_ms != 0 {
+            return Err("--start is stream's".into());
+        }
+        stream(&options).map_err(|error| error.to_string())
+    }))
+}
+
+fn finish(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -145,14 +200,24 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
     // has it: only a time before the start, as a B-frame's at it can be, is
     // moved up.
     let mut muxing = Dictionary::new();
-    // frag_discont has a fragment's time be its first frame's, which the
-    // muxer would otherwise take to be zero.
-    muxing.set(
-        "movflags",
-        "frag_keyframe+empty_moov+default_base_moof+frag_discont",
-    );
     muxing.set("avoid_negative_ts", "make_non_negative");
-    let mut output = format::output_as("pipe:1", "mp4")?;
+    let mut output = match &options.output {
+        Some(path) => {
+            // The index before the media, moved there once it's all written.
+            muxing.set("movflags", "+faststart");
+            format::output_as(path, "mp4")?
+        }
+        None => {
+            // frag_discont has a fragment's time be its first frame's, which
+            // the muxer would otherwise take to be zero.
+            muxing.set(
+                "movflags",
+                "frag_keyframe+empty_moov+default_base_moof+frag_discont",
+            );
+            format::output_as("pipe:1", "mp4")?
+        }
+    };
+    let keep = options.output.is_some();
     // Where the file's own times start, as a camcorder's stream's don't at
     // zero; in microseconds.
     // SAFETY: the context is the input's, open.
@@ -185,9 +250,15 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
                     last: None,
                 }
             }
-            (Way::Transcode, media::Type::Video) => {
-                Lane::Video(Box::new(video_lane(&mut output, &stream, options.encoder)?))
-            }
+            (Way::Transcode, media::Type::Video) => Lane::Video(Box::new(video_lane(
+                &mut output,
+                &stream,
+                options.encoder,
+                keep.then_some(Keep {
+                    max_size: options.max_size,
+                    quality: options.quality,
+                }),
+            )?)),
             (Way::Transcode, media::Type::Audio) => {
                 Lane::Audio(Box::new(audio_lane(&mut output, &stream)?))
             }
@@ -215,6 +286,8 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
         })
         .collect();
 
+    // The last whole second a file to keep said it had made.
+    let mut said = 0;
     for (stream, mut packet) in input.packets() {
         let Some(lane) = lanes.get_mut(stream.index()) else {
             continue;
@@ -222,6 +295,17 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
         let shift = shifts.get(stream.index()).copied().unwrap_or(0);
         packet.set_pts(packet.pts().map(|pts| pts - shift));
         packet.set_dts(packet.dts().map(|dts| dts - shift));
+        if keep && Some(stream.index()) == video.or(audio) {
+            if let Some(at) = packet.pts() {
+                let ms = at.rescale(stream.time_base(), Rational(1, 1000));
+                if ms >= said + 1000 {
+                    said = ms / 1000 * 1000;
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, r#"{{"at":{said}}}"#);
+                    let _ = out.flush();
+                }
+            }
+        }
         match lane {
             Lane::Skip => {}
             Lane::Copy {
@@ -288,14 +372,93 @@ fn graph(
     Ok(graph)
 }
 
+// How a picture to keep is made: the size it fits inside, and its quality.
+#[derive(Clone, Copy)]
+struct Keep {
+    max_size: Option<u32>,
+    quality: u8,
+}
+
+// The size a picture is made at: its pixels made square, then fitted inside
+// max_size where it's larger, each side even, as the encoders take it.
+fn made_size(width: u32, height: u32, aspect: f64, max_size: Option<u32>) -> (u32, u32) {
+    let wide = (f64::from(width) * aspect).max(2.0);
+    let high = f64::from(height).max(2.0);
+    let scale = max_size.map_or(1.0, |max| (f64::from(max) / wide.max(high)).min(1.0));
+    let even = |side: f64| ((side * scale / 2.0).round() as u32 * 2).max(2);
+    (even(wide), even(high))
+}
+
+// A thread for each of the machine's cores, as ffmpeg's own command asks
+// for: a codec's context is given one otherwise, which made a 1080p clip's
+// VP9 take more than twice as long.
+fn threads() -> ffmpeg_next::codec::threading::Config {
+    ffmpeg_next::codec::threading::Config {
+        kind: ffmpeg_next::codec::threading::Type::Frame,
+        count: std::thread::available_parallelism().map_or(1, usize::from),
+        ..Default::default()
+    }
+}
+
+// An encoder to try, the pixels it takes and its settings.
+type Choice = (ffmpeg_next::Codec, format::Pixel, Dictionary<'static>);
+
+// The encoders a picture is tried by, in order. As it's watched: Windows'
+// hardware H.264, then VP9 as fast as it goes. To keep: the hardware's, then
+// Windows' software H.264, then VP9 at the quality asked. h264 alone has no
+// VP9 after it.
+fn choices(choice: Encoder, keep: Option<Keep>) -> Result<Vec<Choice>, ffmpeg_next::Error> {
+    let mut choices = Vec::new();
+    if choice != Encoder::Vp9 {
+        if let Some(codec) = encoder::find_by_name("h264_mf") {
+            let quality = keep.map(|keep| keep.quality);
+            choices.push((codec, format::Pixel::NV12, h264_settings(true, quality)));
+            if let Some(quality) = quality {
+                choices.push((
+                    codec,
+                    format::Pixel::NV12,
+                    h264_settings(false, Some(quality)),
+                ));
+            }
+        }
+    }
+    if choice != Encoder::H264 {
+        choices.push((
+            vp9()?,
+            format::Pixel::YUV420P,
+            match keep {
+                Some(keep) => vp9_kept(keep.quality),
+                None => vp9_settings(),
+            },
+        ));
+    }
+    if choices.is_empty() {
+        return Err(ffmpeg_next::Error::EncoderNotFound);
+    }
+    Ok(choices)
+}
+
+// Media Foundation's H.264, by the machine's hardware or Windows' software;
+// at a quality, from 1 to 100, which its rate control goes by.
+fn h264_settings(hardware: bool, quality: Option<u8>) -> Dictionary<'static> {
+    let mut settings = Dictionary::new();
+    settings.set("hw_encoding", if hardware { "1" } else { "0" });
+    settings.set("rate_control", "quality");
+    if let Some(quality) = quality {
+        settings.set("quality", &quality.to_string());
+    }
+    settings
+}
+
 fn video_lane(
     output: &mut format::context::Output,
     stream: &format::stream::Stream,
     choice: Encoder,
+    keep: Option<Keep>,
 ) -> Result<VideoLane, ffmpeg_next::Error> {
-    let decoder = codec::context::Context::from_parameters(stream.parameters())?
-        .decoder()
-        .video()?;
+    let mut decoding = codec::context::Context::from_parameters(stream.parameters())?;
+    decoding.set_threading(threads());
+    let decoder = decoding.decoder().video()?;
     let rate = match stream.avg_frame_rate() {
         rate if rate.numerator() > 0 => rate,
         _ => Rational(25, 1),
@@ -310,25 +473,16 @@ fn video_lane(
         .flags()
         .contains(format::Flags::GLOBAL_HEADER);
 
-    // Windows' hardware H.264 where there's one; VP9 where not.
-    let hardware = match choice {
-        Encoder::Vp9 => None,
-        Encoder::Auto | Encoder::H264 => encoder::find_by_name("h264_mf"),
-    };
-    let (codec, pixels, settings) = match hardware {
-        Some(codec) => {
-            let mut settings = Dictionary::new();
-            settings.set("hw_encoding", "1");
-            settings.set("rate_control", "quality");
-            (codec, format::Pixel::NV12, settings)
-        }
-        None if choice == Encoder::H264 => return Err(ffmpeg_next::Error::EncoderNotFound),
-        None => (vp9()?, format::Pixel::YUV420P, vp9_settings()),
-    };
+    let (width, height) = made_size(
+        decoder.width(),
+        decoder.height(),
+        f64::from(aspect),
+        keep.and_then(|keep| keep.max_size),
+    );
     let spec = |pixels: format::Pixel| {
         format!(
             // A frame for each frame, not one for each field.
-            "bwdif=mode=send_frame:deint=interlaced,scale='trunc(iw*sar/2)*2':ih,setsar=1,format={}",
+            "bwdif=mode=send_frame:deint=interlaced,scale={width}:{height},setsar=1,format={}",
             pixels
                 .descriptor()
                 .map(|descriptor| descriptor.name())
@@ -345,7 +499,6 @@ fn video_lane(
         aspect.numerator(),
         aspect.denominator(),
     );
-    let width = (decoder.width() as f64 * f64::from(aspect)).round() as u32 / 2 * 2;
     // The graph for the encoder's pixels, and the encoder at the time base
     // the graph gives its frames in: bwdif halves it, so as to have room
     // for a frame of each field, whichever it sends.
@@ -356,21 +509,26 @@ fn video_lane(
             .encoder()
             .video()?;
         context.set_width(width);
-        context.set_height(decoder.height());
+        context.set_height(height);
         context.set_format(pixels);
         context.set_frame_rate(Some(rate));
         context.set_time_base(shown);
+        context.set_threading(threads());
         if global {
             context.set_flags(codec::Flags::GLOBAL_HEADER);
         }
         Ok::<_, ffmpeg_next::Error>((graph, context.open_as_with(codec, settings)?))
     };
-    // A machine without the hardware has the encoder but can't open it.
-    let (graph, encoder) = match open(codec, pixels, settings) {
-        Ok(opened) => opened,
-        Err(error) if choice == Encoder::H264 => return Err(error),
-        Err(_) => open(vp9()?, format::Pixel::YUV420P, vp9_settings())?,
-    };
+    // A machine without the hardware has the encoder but can't open it: the
+    // next is tried, and the last one's error said.
+    let mut opened = Err(ffmpeg_next::Error::EncoderNotFound);
+    for (codec, pixels, settings) in choices(choice, keep)? {
+        opened = open(codec, pixels, settings);
+        if opened.is_ok() {
+            break;
+        }
+    }
+    let (graph, encoder) = opened?;
     let mut added = output.add_stream(encoder.codec())?;
     added.set_parameters(&encoder);
     added.set_time_base(encoder.time_base());
@@ -407,6 +565,37 @@ fn vp9_settings() -> Dictionary<'static> {
     settings.set("crf", "32");
     settings.set("b", "0");
     settings
+}
+
+// To keep: libvpx's realtime setting a step slower than stream's, and its
+// constant quality from the quality asked for, 100 being crf 15, 75 crf 27
+// and 1 crf 63, its least. Its good setting made a 1080p clip 13 % smaller
+// in four times as long (a 10 s clip on an i7-4790K: 13.2 s against 3.0 s),
+// three times slower than it plays, which a library's videos can't wait for.
+fn vp9_kept(quality: u8) -> Dictionary<'static> {
+    let crf = 15 + (100 - u32::from(quality)) * 48 / 99;
+    let mut settings = Dictionary::new();
+    settings.set("deadline", "realtime");
+    settings.set("cpu-used", "6");
+    settings.set("row-mt", "1");
+    settings.set("crf", &crf.to_string());
+    settings.set("b", "0");
+    settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::made_size;
+
+    #[test]
+    fn a_picture_is_made_square_and_fitted_never_larger() {
+        assert_eq!(made_size(640, 480, 1.0, None), (640, 480));
+        // A DVD's 720 by 576 of pixels 16:15 wide.
+        assert_eq!(made_size(720, 576, 16.0 / 15.0, None), (768, 576));
+        assert_eq!(made_size(720, 576, 16.0 / 15.0, Some(384)), (384, 288));
+        assert_eq!(made_size(320, 240, 1.0, Some(1920)), (320, 240));
+        assert_eq!(made_size(1080, 1920, 1.0, Some(1280)), (720, 1280));
+    }
 }
 
 fn audio_lane(
