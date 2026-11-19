@@ -29,6 +29,8 @@ use ffmpeg_next::{
     Dictionary, Packet, Rational, Rescale, codec, decoder, encoder, filter, format, frame, media,
 };
 
+use crate::system;
+
 const MICROSECONDS: Rational = Rational(1, 1_000_000);
 
 #[derive(Clone, Copy, PartialEq)]
@@ -138,6 +140,27 @@ pub fn render(args: &[String]) -> ExitCode {
     }))
 }
 
+// What a stream or a rendition fails by: ffmpeg's error, or the system's.
+enum Failure {
+    Ffmpeg(ffmpeg_next::Error),
+    System(String),
+}
+
+impl From<ffmpeg_next::Error> for Failure {
+    fn from(error: ffmpeg_next::Error) -> Self {
+        Failure::Ffmpeg(error)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Failure::Ffmpeg(error) => error.fmt(formatter),
+            Failure::System(error) => formatter.write_str(error),
+        }
+    }
+}
+
 fn finish(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,10 +184,11 @@ enum Lane {
 }
 
 // Each lane keeps the time of the last packet it wrote (last), in its
-// output's time base.
+// output's time base. Its decoder is ffmpeg's; one with none is given the
+// system's frames.
 struct VideoLane {
     output: usize,
-    decoder: decoder::Video,
+    decoder: Option<decoder::Video>,
     graph: filter::Graph,
     encoder: encoder::Video,
     last: Option<i64>,
@@ -172,7 +196,7 @@ struct VideoLane {
 
 struct AudioLane {
     output: usize,
-    decoder: decoder::Audio,
+    decoder: Option<decoder::Audio>,
     graph: filter::Graph,
     encoder: encoder::Audio,
     last: Option<i64>,
@@ -183,25 +207,35 @@ struct AudioLane {
     next: Option<i64>,
 }
 
-fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
-    let mut input = format::input(&options.input)?;
-    let video = input
-        .streams()
-        .best(media::Type::Video)
-        .map(|stream| stream.index());
-    let audio = input
-        .streams()
-        .best(media::Type::Audio)
-        .map(|stream| stream.index());
+// Whether a stream to be made again has a codec this build has no decoder
+// for, which the system's decoders are for.
+fn needs_system(input: &format::context::Input, options: &Options) -> bool {
+    [
+        (media::Type::Video, options.video),
+        (media::Type::Audio, options.audio),
+    ]
+    .into_iter()
+    .any(|(medium, way)| {
+        way == Way::Transcode
+            && input
+                .streams()
+                .best(medium)
+                .is_some_and(|stream| decoder::find(stream.parameters().id()).is_none())
+    })
+}
 
-    // Fragments from the first keyframe on, with no index at the end to
-    // wait for. Their times are the file's own, from its start, wherever the
-    // stream starts in it, so that a stream from a time is where a player
-    // has it: only a time before the start, as a B-frame's at it can be, is
-    // moved up.
+// The MP4 a stream or a rendition is written into, and how it's muxed.
+// A stream is fragments from the first keyframe on, with no index at the
+// end to wait for. Their times are the file's own, from its start, wherever
+// the stream starts in it, so that a stream from a time is where a player
+// has it: only a time before the start, as a B-frame's at it can be, is
+// moved up.
+fn open_output(
+    options: &Options,
+) -> Result<(format::context::Output, Dictionary<'static>), ffmpeg_next::Error> {
     let mut muxing = Dictionary::new();
     muxing.set("avoid_negative_ts", "make_non_negative");
-    let mut output = match &options.output {
+    let output = match &options.output {
         Some(path) => {
             // The index before the media, moved there once it's all written.
             muxing.set("movflags", "+faststart");
@@ -217,6 +251,47 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
             format::output_as("pipe:1", "mp4")?
         }
     };
+    Ok((output, muxing))
+}
+
+fn keep_of(options: &Options) -> Option<Keep> {
+    options.output.is_some().then_some(Keep {
+        max_size: options.max_size,
+        quality: options.quality,
+    })
+}
+
+// Says on stdout how far a file to keep is, each whole second; said is the
+// last it said.
+fn progress(said: &mut i64, ms: i64) {
+    if ms >= *said + 1000 {
+        *said = ms / 1000 * 1000;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, r#"{{"at":{said}}}"#);
+        let _ = out.flush();
+    }
+}
+
+fn stream(options: &Options) -> Result<(), Failure> {
+    // What this build can't decode is decoded by the system, as is a file
+    // the build can't read at all; the system's reader does all of it then.
+    let transcoding = options.video == Way::Transcode || options.audio == Way::Transcode;
+    let mut input = match format::input(&options.input) {
+        Ok(input) if needs_system(&input, options) => return system_stream(options),
+        Ok(input) => input,
+        Err(_) if transcoding => return system_stream(options),
+        Err(error) => return Err(error.into()),
+    };
+    let video = input
+        .streams()
+        .best(media::Type::Video)
+        .map(|stream| stream.index());
+    let audio = input
+        .streams()
+        .best(media::Type::Audio)
+        .map(|stream| stream.index());
+
+    let (mut output, muxing) = open_output(options)?;
     let keep = options.output.is_some();
     // Where the file's own times start, as a camcorder's stream's don't at
     // zero; in microseconds.
@@ -250,17 +325,44 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
                     last: None,
                 }
             }
-            (Way::Transcode, media::Type::Video) => Lane::Video(Box::new(video_lane(
-                &mut output,
-                &stream,
-                options.encoder,
-                keep.then_some(Keep {
-                    max_size: options.max_size,
-                    quality: options.quality,
-                }),
-            )?)),
+            (Way::Transcode, media::Type::Video) => {
+                let mut decoding = codec::context::Context::from_parameters(stream.parameters())?;
+                decoding.set_threading(threads());
+                let decoder = decoding.decoder().video()?;
+                let source = PictureSource {
+                    width: decoder.width(),
+                    height: decoder.height(),
+                    pixels: decoder.format(),
+                    time_base: stream.time_base(),
+                    aspect: match decoder.aspect_ratio() {
+                        aspect if aspect.numerator() > 0 => aspect,
+                        _ => Rational(1, 1),
+                    },
+                    rate: match stream.avg_frame_rate() {
+                        rate if rate.numerator() > 0 => rate,
+                        _ => Rational(25, 1),
+                    },
+                    turn: turn_of(&stream),
+                };
+                Lane::Video(Box::new(video_lane(
+                    &mut output,
+                    &source,
+                    Some(decoder),
+                    options.encoder,
+                    keep_of(options),
+                )?))
+            }
             (Way::Transcode, media::Type::Audio) => {
-                Lane::Audio(Box::new(audio_lane(&mut output, &stream)?))
+                let decoder = codec::context::Context::from_parameters(stream.parameters())?
+                    .decoder()
+                    .audio()?;
+                let source = SoundSource {
+                    rate: decoder.rate(),
+                    format: decoder.format(),
+                    layout: layout_mask(&decoder),
+                    time_base: stream.time_base(),
+                };
+                Lane::Audio(Box::new(audio_lane(&mut output, &source, Some(decoder))?))
             }
             (Way::Transcode, _) => Lane::Skip,
         };
@@ -297,13 +399,7 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
         packet.set_dts(packet.dts().map(|dts| dts - shift));
         if keep && Some(stream.index()) == video.or(audio) {
             if let Some(at) = packet.pts() {
-                let ms = at.rescale(stream.time_base(), Rational(1, 1000));
-                if ms >= said + 1000 {
-                    said = ms / 1000 * 1000;
-                    let mut out = std::io::stdout().lock();
-                    let _ = writeln!(out, r#"{{"at":{said}}}"#);
-                    let _ = out.flush();
-                }
+                progress(&mut said, at.rescale(stream.time_base(), Rational(1, 1000)));
             }
         }
         match lane {
@@ -321,12 +417,20 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
             Lane::Video(lane) => {
                 // A packet that can't be decoded is passed over, as a player
                 // would.
-                if lane.decoder.send_packet(&packet).is_ok() {
+                let sent = lane
+                    .decoder
+                    .as_mut()
+                    .is_some_and(|decoder| decoder.send_packet(&packet).is_ok());
+                if sent {
                     lane.drain(&mut output, time_bases[lane.output])?;
                 }
             }
             Lane::Audio(lane) => {
-                if lane.decoder.send_packet(&packet).is_ok() {
+                let sent = lane
+                    .decoder
+                    .as_mut()
+                    .is_some_and(|decoder| decoder.send_packet(&packet).is_ok());
+                if sent {
                     lane.drain(&mut output, time_bases[lane.output])?;
                 }
             }
@@ -335,19 +439,141 @@ fn stream(options: &Options) -> Result<(), ffmpeg_next::Error> {
     for lane in &mut lanes {
         match lane {
             Lane::Video(lane) => {
-                let _ = lane.decoder.send_eof();
+                if let Some(decoder) = lane.decoder.as_mut() {
+                    let _ = decoder.send_eof();
+                }
                 lane.drain(&mut output, time_bases[lane.output])?;
                 lane.finish(&mut output, time_bases[lane.output])?;
             }
             Lane::Audio(lane) => {
-                let _ = lane.decoder.send_eof();
+                if let Some(decoder) = lane.decoder.as_mut() {
+                    let _ = decoder.send_eof();
+                }
                 lane.drain(&mut output, time_bases[lane.output])?;
                 lane.finish(&mut output, time_bases[lane.output])?;
             }
             _ => {}
         }
     }
-    output.write_trailer()
+    Ok(output.write_trailer()?)
+}
+
+// A stream or a rendition decoded by the system's reader: its picture and
+// its sound each made again, as there's nothing of the file's own to copy.
+fn system_stream(options: &Options) -> Result<(), Failure> {
+    let mut reader = system::Reader::open(
+        &options.input,
+        options.video != Way::None,
+        options.audio != Way::None,
+    )
+    .map_err(Failure::System)?;
+    let (mut output, muxing) = open_output(options)?;
+    let mut video = match &reader.picture {
+        Some(picture) => Some(video_lane(
+            &mut output,
+            &PictureSource {
+                width: picture.width,
+                height: picture.height,
+                pixels: format::Pixel::NV12,
+                time_base: system::TIME_BASE,
+                aspect: picture.aspect,
+                rate: picture.rate.unwrap_or(Rational(30, 1)),
+                turn: picture.turn,
+            },
+            None,
+            options.encoder,
+            keep_of(options),
+        )?),
+        None => None,
+    };
+    let mut audio = match &reader.sound {
+        Some(sound) => Some(audio_lane(
+            &mut output,
+            &SoundSource {
+                rate: sound.rate,
+                format: format::Sample::F32(format::sample::Type::Packed),
+                layout: format!(
+                    "0x{:x}",
+                    ffmpeg_next::ChannelLayout::default(i32::from(sound.channels)).bits()
+                ),
+                time_base: system::TIME_BASE,
+            },
+            None,
+        )?),
+        None => None,
+    };
+    if video.is_none() && audio.is_none() {
+        return Err(Failure::System("it has nothing to make".into()));
+    }
+    if options.start_ms > 0 {
+        reader.seek(options.start_ms).map_err(Failure::System)?;
+    }
+    output.write_header_with(muxing)?;
+    let time_base = |index: usize| {
+        output
+            .stream(index)
+            .map(|stream| stream.time_base())
+            .unwrap_or(Rational(1, 1))
+    };
+    let video_to = video.as_ref().map(|lane| time_base(lane.output));
+    let audio_to = audio.as_ref().map(|lane| time_base(lane.output));
+    let keep = options.output.is_some();
+    let mut said = 0;
+    while let Some(decoded) = reader.read().map_err(Failure::System)? {
+        match decoded {
+            system::Decoded::Video(frame) => {
+                if let (Some(lane), Some(to)) = (video.as_mut(), video_to) {
+                    if keep {
+                        progress(&mut said, frame.pts().unwrap_or(0) / 10_000);
+                    }
+                    lane.push(&frame, &mut output, to)?;
+                }
+            }
+            system::Decoded::Audio(frame) => {
+                if let (Some(lane), Some(to)) = (audio.as_mut(), audio_to) {
+                    if keep && video.is_none() {
+                        progress(&mut said, frame.pts().unwrap_or(0) / 10_000);
+                    }
+                    lane.push(&frame, &mut output, to)?;
+                }
+            }
+        }
+    }
+    if let (Some(lane), Some(to)) = (video.as_mut(), video_to) {
+        lane.finish(&mut output, to)?;
+    }
+    if let (Some(lane), Some(to)) = (audio.as_mut(), audio_to) {
+        lane.finish(&mut output, to)?;
+    }
+    Ok(output.write_trailer()?)
+}
+
+// How far a picture is to be turned clockwise to be upright, by its stream's
+// display matrix, in quarter turns: as ffmpeg's own command turns it.
+fn turn_of(stream: &format::stream::Stream) -> u32 {
+    // SAFETY: the stream's parameters and their side data are the input's,
+    // open; the matrix is nine 32-bit numbers where there's one.
+    let degrees = unsafe {
+        let parameters = stream.parameters().as_ptr();
+        let data = ffmpeg_next::ffi::av_packet_side_data_get(
+            (*parameters).coded_side_data,
+            (*parameters).nb_coded_side_data,
+            ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+        );
+        if data.is_null() || (*data).size < 36 {
+            return 0;
+        }
+        -ffmpeg_next::ffi::av_display_rotation_get((*data).data as *const i32)
+    };
+    quarter_turn(degrees)
+}
+
+// A turn in degrees, either way, as the nearest quarter turn clockwise.
+fn quarter_turn(degrees: f64) -> u32 {
+    if !degrees.is_finite() {
+        return 0;
+    }
+    ((degrees / 90.0).round() as i64).rem_euclid(4) as u32 * 90
 }
 
 fn graph(
@@ -450,39 +676,59 @@ fn h264_settings(hardware: bool, quality: Option<u8>) -> Dictionary<'static> {
     settings
 }
 
+// The frames a picture's lane is given: their size, pixels and time base,
+// the pixels' shape, the frame rate, and how far they're to be turned
+// clockwise to be upright, in degrees.
+struct PictureSource {
+    width: u32,
+    height: u32,
+    pixels: format::Pixel,
+    time_base: Rational,
+    aspect: Rational,
+    rate: Rational,
+    turn: u32,
+}
+
+// The filters that turn a picture clockwise by a quarter turn or more.
+fn turning(turn: u32) -> &'static str {
+    match turn {
+        90 => ",transpose=clock",
+        180 => ",hflip,vflip",
+        270 => ",transpose=cclock",
+        _ => "",
+    }
+}
+
 fn video_lane(
     output: &mut format::context::Output,
-    stream: &format::stream::Stream,
+    from: &PictureSource,
+    decoder: Option<decoder::Video>,
     choice: Encoder,
     keep: Option<Keep>,
 ) -> Result<VideoLane, ffmpeg_next::Error> {
-    let mut decoding = codec::context::Context::from_parameters(stream.parameters())?;
-    decoding.set_threading(threads());
-    let decoder = decoding.decoder().video()?;
-    let rate = match stream.avg_frame_rate() {
-        rate if rate.numerator() > 0 => rate,
-        _ => Rational(25, 1),
-    };
-    let aspect = match decoder.aspect_ratio() {
-        aspect if aspect.numerator() > 0 => aspect,
-        _ => Rational(1, 1),
-    };
-    let time_base = stream.time_base();
     let global = output
         .format()
         .flags()
         .contains(format::Flags::GLOBAL_HEADER);
 
-    let (width, height) = made_size(
-        decoder.width(),
-        decoder.height(),
-        f64::from(aspect),
+    let (scaled_width, scaled_height) = made_size(
+        from.width,
+        from.height,
+        f64::from(from.aspect),
         keep.and_then(|keep| keep.max_size),
     );
+    // Turned a quarter, it's as high as it was wide.
+    let (width, height) = if from.turn % 180 == 90 {
+        (scaled_height, scaled_width)
+    } else {
+        (scaled_width, scaled_height)
+    };
+    let rate = from.rate;
     let spec = |pixels: format::Pixel| {
         format!(
             // A frame for each frame, not one for each field.
-            "bwdif=mode=send_frame:deint=interlaced,scale={width}:{height},setsar=1,format={}",
+            "bwdif=mode=send_frame:deint=interlaced,scale={scaled_width}:{scaled_height},setsar=1{},format={}",
+            turning(from.turn),
             pixels
                 .descriptor()
                 .map(|descriptor| descriptor.name())
@@ -491,13 +737,13 @@ fn video_lane(
     };
     let source = format!(
         "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
-        decoder.width(),
-        decoder.height(),
-        ffmpeg_next::ffi::AVPixelFormat::from(decoder.format()) as i32,
-        time_base.numerator(),
-        time_base.denominator(),
-        aspect.numerator(),
-        aspect.denominator(),
+        from.width,
+        from.height,
+        ffmpeg_next::ffi::AVPixelFormat::from(from.pixels) as i32,
+        from.time_base.numerator(),
+        from.time_base.denominator(),
+        from.aspect.numerator(),
+        from.aspect.denominator(),
     );
     // The graph for the encoder's pixels, and the encoder at the time base
     // the graph gives its frames in: bwdif halves it, so as to have room
@@ -588,6 +834,18 @@ mod tests {
     use super::made_size;
 
     #[test]
+    fn a_turn_is_the_nearest_quarter_clockwise() {
+        use super::quarter_turn;
+        assert_eq!(quarter_turn(90.0), 90);
+        assert_eq!(quarter_turn(-90.0), 270);
+        assert_eq!(quarter_turn(180.0), 180);
+        assert_eq!(quarter_turn(-180.0), 180);
+        assert_eq!(quarter_turn(89.4), 90);
+        assert_eq!(quarter_turn(0.0), 0);
+        assert_eq!(quarter_turn(f64::NAN), 0);
+    }
+
+    #[test]
     fn a_picture_is_made_square_and_fitted_never_larger() {
         assert_eq!(made_size(640, 480, 1.0, None), (640, 480));
         // A DVD's 720 by 576 of pixels 16:15 wide.
@@ -598,13 +856,20 @@ mod tests {
     }
 }
 
+// The frames a sound's lane is given: their rate, sample format, channels as
+// abuffer's mask, and time base.
+struct SoundSource {
+    rate: u32,
+    format: format::Sample,
+    layout: String,
+    time_base: Rational,
+}
+
 fn audio_lane(
     output: &mut format::context::Output,
-    stream: &format::stream::Stream,
+    from: &SoundSource,
+    decoder: Option<decoder::Audio>,
 ) -> Result<AudioLane, ffmpeg_next::Error> {
-    let decoder = codec::context::Context::from_parameters(stream.parameters())?
-        .decoder()
-        .audio()?;
     let codec = encoder::find_by_name("libopus").ok_or(ffmpeg_next::Error::EncoderNotFound)?;
     let mut context = codec::context::Context::new_with_codec(codec)
         .encoder()
@@ -626,14 +891,14 @@ fn audio_lane(
     added.set_parameters(&encoder);
     added.set_time_base((1, 48_000));
 
-    let time_base = stream.time_base();
+    let time_base = from.time_base;
     let source = format!(
         "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
         time_base.numerator(),
         time_base.denominator(),
-        decoder.rate(),
-        decoder.format().name(),
-        layout_mask(&decoder),
+        from.rate,
+        from.format.name(),
+        from.layout,
     );
     let mut graph = graph(
         "abuffer",
@@ -710,16 +975,34 @@ impl VideoLane {
         output: &mut format::context::Output,
         to: Rational,
     ) -> Result<(), ffmpeg_next::Error> {
+        let Some(mut decoder) = self.decoder.take() else {
+            return Ok(());
+        };
         let mut decoded = frame::Video::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
+        let mut result = Ok(());
+        while decoder.receive_frame(&mut decoded).is_ok() {
             let timestamp = decoded.timestamp();
             decoded.set_pts(timestamp);
-            if let Some(mut source) = self.graph.get("in") {
-                source.source().add(&decoded)?;
+            result = self.push(&decoded, output, to);
+            if result.is_err() {
+                break;
             }
-            self.pull(output, to)?;
         }
-        Ok(())
+        self.decoder = Some(decoder);
+        result
+    }
+
+    // A frame, timed, through the filters into the encoder.
+    fn push(
+        &mut self,
+        frame: &frame::Video,
+        output: &mut format::context::Output,
+        to: Rational,
+    ) -> Result<(), ffmpeg_next::Error> {
+        if let Some(mut source) = self.graph.get("in") {
+            source.source().add(frame)?;
+        }
+        self.pull(output, to)
     }
 
     fn pull(
@@ -791,16 +1074,35 @@ impl AudioLane {
         output: &mut format::context::Output,
         to: Rational,
     ) -> Result<(), ffmpeg_next::Error> {
+        let Some(mut decoder) = self.decoder.take() else {
+            return Ok(());
+        };
         let mut decoded = frame::Audio::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
+        let mut result = Ok(());
+        while decoder.receive_frame(&mut decoded).is_ok() {
             let timestamp = self.time_of(&decoded);
             decoded.set_pts(timestamp);
-            if let Some(mut source) = self.graph.get("in") {
-                source.source().add(&decoded)?;
+            result = self.push(&decoded, output, to);
+            if result.is_err() {
+                break;
             }
-            self.pull(output, to)?;
         }
-        Ok(())
+        self.decoder = Some(decoder);
+        result
+    }
+
+    // A frame, timed, through the filters into the encoder. The system's are
+    // timed as they come, without the gaps ffmpeg's decoders leave.
+    fn push(
+        &mut self,
+        frame: &frame::Audio,
+        output: &mut format::context::Output,
+        to: Rational,
+    ) -> Result<(), ffmpeg_next::Error> {
+        if let Some(mut source) = self.graph.get("in") {
+            source.source().add(frame)?;
+        }
+        self.pull(output, to)
     }
 
     fn pull(

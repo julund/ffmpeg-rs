@@ -108,6 +108,120 @@ fn caps_say_what_it_was_built_with() {
     assert_eq!(listed("decoders", "hevc"), built_with("hevc"));
     assert_eq!(listed("decoders", "vc1"), built_with("vc1"));
     assert_eq!(listed("encoders", "aac"), built_with("aac-encoder"));
+    // What the system decodes is said apart, of a closed set.
+    for name in caps["system"].as_array().expect("system") {
+        assert!(
+            ["h264", "hevc", "vc1", "wmv3", "aac"].contains(&name.as_str().unwrap_or("")),
+            "{name}"
+        );
+    }
+}
+
+// Whether the system decodes each of these, as caps says.
+fn system_decodes(names: &[&str]) -> bool {
+    let replies = serve(&[serde_json::json!({ "op": "caps", "id": 1 })]);
+    let system = replies[0].0["ok"]["system"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    names
+        .iter()
+        .all(|name| system.iter().any(|value| value == name))
+}
+
+// The colour of a pixel of a PNG frame, as red, green and blue: decoded by
+// ffmpeg's PNG decoder, given the bytes, as the build has no demuxer of PNGs.
+fn pixel(png: &[u8], x: usize, y: usize) -> [u8; 3] {
+    ffmpeg_next::init().expect("ffmpeg");
+    let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::PNG).expect("a PNG decoder");
+    let mut decoder = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+        .decoder()
+        .video()
+        .expect("it opens");
+    decoder
+        .send_packet(&ffmpeg_next::Packet::copy(png))
+        .expect("the PNG is sent");
+    decoder.send_eof().expect("its end");
+    let mut frame = ffmpeg_next::frame::Video::empty();
+    decoder.receive_frame(&mut frame).expect("a frame");
+    let size = match frame.format() {
+        ffmpeg_next::format::Pixel::RGBA => 4,
+        ffmpeg_next::format::Pixel::RGB24 => 3,
+        other => panic!("a PNG of {other:?}"),
+    };
+    let at = y * frame.stride(0) + x * size;
+    let data = frame.data(0);
+    [data[at], data[at + 1], data[at + 2]]
+}
+
+// Renders a fixture of four quadrants, red, green, blue and white from its
+// top left, which its display matrix says to turn a quarter clockwise, and
+// says that it was: 240 by 320, blue top left and red top right.
+fn renders_upright(name: &str) {
+    let path = scratch(&format!("upright-{name}"));
+    let output = render(&[
+        "--input",
+        &fixture(name),
+        "--output",
+        &path,
+        "--video",
+        "transcode",
+        "--audio",
+        "transcode",
+        "--encoder",
+        "vp9",
+    ]);
+    assert!(
+        output.status.success(),
+        "{name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(&path).expect("the file is there");
+    assert_eq!(picture_size(&bytes, "vp09"), Some((240, 320)), "{name}");
+    let replies = serve(&[
+        serde_json::json!({ "op": "frame", "id": 1, "path": path, "at": 0.5, "size": 4096 }),
+    ]);
+    let (frame, png) = &replies[0];
+    assert_eq!(frame["ok"]["width"], 240, "{name}: {frame}");
+    let reddish = |[red, green, blue]: [u8; 3]| red > 180 && green < 80 && blue < 80;
+    let bluish = |[red, green, blue]: [u8; 3]| blue > 180 && red < 80 && green < 80;
+    assert!(bluish(pixel(png, 20, 20)), "{name}: top left");
+    assert!(reddish(pixel(png, 220, 20)), "{name}: top right");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_picture_made_again_is_turned_upright_by_its_display_matrix() {
+    renders_upright("turned-mpeg4.mp4");
+}
+
+#[test]
+fn a_phone_video_is_made_again_by_the_system_and_turned_upright() {
+    if !system_decodes(&["h264", "aac"]) {
+        eprintln!("the system decodes no H.264 or AAC here: not tested");
+        return;
+    }
+    renders_upright("portrait.mp4");
+    // And streamed so, from a time on, its sound made again too.
+    let output = stream(&[
+        "--input",
+        &fixture("portrait.mp4"),
+        "--video",
+        "transcode",
+        "--audio",
+        "transcode",
+        "--encoder",
+        "vp9",
+        "--start",
+        "500",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(has(&output.stdout, "moof") && has(&output.stdout, "vp09"));
+    assert!(has(&output.stdout, "Opus"));
 }
 
 #[test]

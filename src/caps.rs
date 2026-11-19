@@ -12,6 +12,10 @@ pub struct Caps {
     pub encoders: Vec<String>,
     pub demuxers: Vec<String>,
     pub muxers: Vec<String>,
+    /// What the system decodes of what this build may not, which stream and
+    /// render make again by it: h264, hevc, vc1, wmv3 and aac, where the
+    /// machine has them.
+    pub system: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +81,7 @@ pub fn caps() -> Caps {
         encoders,
         demuxers,
         muxers,
+        system: crate::system::decoders(),
     }
 }
 

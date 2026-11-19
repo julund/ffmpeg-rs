@@ -13,6 +13,7 @@ mod caps;
 mod frame;
 mod protocol;
 mod stream;
+mod system;
 
 use std::process::ExitCode;
 

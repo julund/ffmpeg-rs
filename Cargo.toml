@@ -1,6 +1,6 @@
 [package]
 name = "ffmpeg-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "LGPL-2.1-or-later"
 description = "A small program over a trimmed, LGPL ffmpeg: what it decodes, a frame of a video, a video remuxed or transcoded for a webview to play, and one made into a file to keep"
@@ -18,6 +18,17 @@ ffmpeg-next = { version = "9.1", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Media Foundation, the system's own decoders, for what the build has none
+# for: H.264, HEVC, VC-1 and AAC, where Windows has them.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+] }
 
 [profile.release]
 lto = true

@@ -19,6 +19,8 @@ ffmpeg-rs --protocol  the JSON Schema of serve's requests and replies (protocol.
 ffmpeg-rs --version   this program's version, ffmpeg's, and the line ffmpeg was configured with
 ```
 
+What the build has no decoder for, as H.264, HEVC, VC-1 and AAC, `stream` and `render` decode by the system's own decoders where they make it again: on Windows Media Foundation's source reader, which reads the file, decodes its first picture and first sound, deinterlaces the picture and turns it upright. `caps` says which of those the machine has as `system`. Elsewhere there's none yet. A picture ffmpeg decodes is turned upright by its display matrix, as a phone's is, by ffmpeg's own filters.
+
 `render` writes `{"at":<ms>}` on stdout as each second of the video is made, from its start. Its quality is 75 where it isn't said; it's Media Foundation's for H.264 and a constant quality for VP9 (75 is crf 27). A file it leaves after it failed or was killed is half made, so its caller writes it under a name of its own and renames it once it's done.
 
 On a 10-second 1080p clip at 30 frames with its sound, on an i7-4790K: H.264 by the machine's encoder in 2.5 s and VP9 in 3.2 s; Windows' software H.264 took 1.6 s by ffmpeg's own command, and libvpx's good setting 13.2 s for a file 13 % smaller.

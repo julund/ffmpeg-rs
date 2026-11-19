@@ -51,9 +51,14 @@
 				"decoders": { "type": "array", "items": { "type": "string" } },
 				"encoders": { "type": "array", "items": { "type": "string" } },
 				"demuxers": { "type": "array", "items": { "type": "string" } },
-				"muxers": { "type": "array", "items": { "type": "string" } }
+				"muxers": { "type": "array", "items": { "type": "string" } },
+				"system": {
+					"description": "What the system decodes of what the build may not, which stream and render make again by it.",
+					"type": "array",
+					"items": { "enum": ["h264", "hevc", "vc1", "wmv3", "aac"] }
+				}
 			},
-			"required": ["decoders", "encoders", "demuxers", "muxers"],
+			"required": ["decoders", "encoders", "demuxers", "muxers", "system"],
 			"additionalProperties": false
 		},
 		"frame": {

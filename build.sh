@@ -180,6 +180,25 @@ section() {
 	shift
 	for file in "$@"; do tr -d '\r' <"$file" && printf '\n'; done
 }
+# The Rust crates built into it, for the target, each with the licence it
+# says and the licence files its source has.
+crates() {
+	local registry
+	registry="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/registry/src"
+	# Proc macros run as it's built, and aren't in it.
+	cargo tree --locked -e normal,no-proc-macro --target "$TARGET" --prefix none -f '{p}|{l}' |
+		sed 's/ (.*)//' | sort -u |
+		while IFS='|' read -r crate licence; do
+			local name=${crate% v*} version=${crate##* v}
+			[ "$name" = ffmpeg-rs ] && continue
+			local dir files=()
+			dir=$(ls -d "$registry"/*/"$name-$version" 2>/dev/null | head -1)
+			for file in "$dir"/LICENSE* "$dir"/license* "$dir"/COPYING*; do
+				[ -f "$file" ] && files+=("$file")
+			done
+			section "The Rust crate $name $version: ${licence:-as its source says}" "${files[@]}"
+		done
+}
 {
 	section "ffmpeg-rs $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1): LGPL 2.1 or later" LICENSE
 	section "FFmpeg $FFMPEG_VERSION ($FFMPEG_URL): LGPL 2.1 or later" \
@@ -189,6 +208,7 @@ section() {
 	section "Opus $OPUS_VERSION ($OPUS_URL): BSD 3-clause" "$LIBS/build/opus/COPYING"
 	section "zlib, as MSYS2's mingw-w64-x86_64-zlib has it: zlib License" \
 		"$(dirname "$(command -v gcc)")/../share/licenses/zlib/LICENSE"
+	crates
 } >"$RELEASE/NOTICES.txt"
 
 if [ -n "$TEST" ]; then
