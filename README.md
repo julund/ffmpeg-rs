@@ -42,7 +42,9 @@ pacman -S --needed make diffutils git mingw-w64-x86_64-toolchain mingw-w64-x86_6
 rustup target add x86_64-pc-windows-gnu
 ```
 
-and Rust on the PATH. `./build.sh` downloads ffmpeg, libvpx and Opus at the versions it pins, each checked by its sha256, builds them into `target/ffmpeg/`, by what went into them, so they're built again only when that changes, and then the program against them, and prints the path of the `.exe`. The first build takes some minutes; the ones after, while nothing in ffmpeg changes, as long as cargo does.
+and Rust on the PATH. `./build.sh` downloads ffmpeg, libvpx and Opus at the versions it pins, each checked by its sha256, builds them into `target/ffmpeg/`, by what went into them, so they're built again only when that changes, and then the program against them, and prints the path of the `.exe`, beside which `NOTICES.txt` has the licences of everything built into it. The first build takes some minutes; the ones after, while nothing in ffmpeg changes, as long as cargo does. `./build.sh --test` runs the tests against the build, on the clips in `tests/fixtures`.
+
+CI builds and tests it with the free group and with every group. A tag `v*` releases the free build alone, with its notices and their sha256: no build with a codec under patent is given out.
 
 ## License
 

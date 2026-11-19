@@ -5,11 +5,13 @@
 #
 #   ./build.sh                  the free group alone
 #   ./build.sh --with=h264,vc1  and those groups of codecs.conf
+#   ./build.sh --test           and then its tests, against that build
 #
 # On Windows it runs in MSYS2's MINGW64 shell (or bash -l with MSYSTEM set
 # to MINGW64), with the packages README.md names. What it builds of ffmpeg
 # is kept under target/ffmpeg/, by what went into it, and made again only
-# when that changes. It prints the path of the program it made last.
+# when that changes. It prints the path of the program it made last, beside
+# which NOTICES.txt has the licences of what's built into it.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,11 +29,13 @@ OPUS_URL=https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz
 OPUS_SHA256=65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1
 
 WITH=""
+TEST=""
 for argument in "$@"; do
 	case $argument in
 	--with=*) WITH=${argument#--with=} ;;
+	--test) TEST=1 ;;
 	*)
-		echo "Usage: ./build.sh [--with=group,group]" >&2
+		echo "Usage: ./build.sh [--with=group,group] [--test]" >&2
 		exit 2
 		;;
 	esac
@@ -161,4 +165,32 @@ cargo build --release --locked --target "$TARGET"
 # Where cargo puts what it builds, which a configuration may have elsewhere.
 OUT=$(cargo metadata --format-version 1 --no-deps |
 	sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | sed 's/\\\\/\//g')
-echo "$OUT/$TARGET/release/ffmpeg-rs.exe"
+RELEASE=$OUT/$TARGET/release
+
+# The licences of what's built into the program, which go wherever it does:
+# its own, ffmpeg's and the libraries' it links, from their sources.
+section() {
+	printf '%s\n\n' "------------------------------------------------------------------------"
+	printf '%s\n\n' "$1"
+	shift
+	for file in "$@"; do tr -d '\r' <"$file" && printf '\n'; done
+}
+{
+	section "ffmpeg-rs $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1): LGPL 2.1 or later" LICENSE
+	section "FFmpeg $FFMPEG_VERSION ($FFMPEG_URL): LGPL 2.1 or later" \
+		"$PREFIX/build/ffmpeg/LICENSE.md" "$PREFIX/build/ffmpeg/COPYING.LGPLv2.1"
+	section "libvpx $VPX_VERSION ($VPX_URL): BSD 3-clause, and its patent grant" \
+		"$LIBS/build/libvpx/LICENSE" "$LIBS/build/libvpx/PATENTS"
+	section "Opus $OPUS_VERSION ($OPUS_URL): BSD 3-clause" "$LIBS/build/opus/COPYING"
+	section "zlib, as MSYS2's mingw-w64-x86_64-zlib has it: zlib License" \
+		"$(dirname "$(command -v gcc)")/../share/licenses/zlib/LICENSE"
+} >"$RELEASE/NOTICES.txt"
+
+if [ -n "$TEST" ]; then
+	# The tests ask the program which groups it was built with.
+	FFMPEG_RS_GROUPS=$(
+		IFS=,
+		echo "${CHOSEN[*]}"
+	) cargo test --release --locked --target "$TARGET"
+fi
+echo "$RELEASE/ffmpeg-rs.exe"

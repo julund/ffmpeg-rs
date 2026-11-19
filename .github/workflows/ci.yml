@@ -1,0 +1,86 @@
+# Builds and tests the program with the free group alone and with every
+# group, so that neither rots while the other is the one used. A tag v*
+# releases the free build alone, with its notices: no build with a codec
+# under patent is given out.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: free
+            with: ""
+          - name: every group
+            with: h264,hevc,vc1,aac-encoder
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          # Cargo, from the step before, on the PATH as Windows has it.
+          path-type: inherit
+          install: >-
+            make diffutils git
+            mingw-w64-x86_64-toolchain mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-clang mingw-w64-x86_64-zlib
+      # ffmpeg and its libraries, built again only when what goes into them
+      # changes; their sources, downloaded once.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            target/ffmpeg
+            target/sources
+          key: ffmpeg-${{ matrix.name }}-${{ hashFiles('build.sh', 'codecs.conf') }}
+          restore-keys: ffmpeg-${{ matrix.name }}-
+      - run: ./build.sh --with=${{ matrix.with }} --test
+      - if: matrix.with == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: free
+          path: |
+            target/x86_64-pc-windows-gnu/release/ffmpeg-rs.exe
+            target/x86_64-pc-windows-gnu/release/NOTICES.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: free
+      - name: Release the free build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          mv ffmpeg-rs.exe "ffmpeg-rs-$version-x86_64-pc-windows-gnu.exe"
+          mv NOTICES.txt "ffmpeg-rs-$version-NOTICES.txt"
+          sha256sum ffmpeg-rs-* > "ffmpeg-rs-$version-SHA256SUMS.txt"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "ffmpeg-rs $version" \
+            --notes "The free build alone: no codec under patent. Its source is this tag; the sources of what's built into it, and their licences, are in the notices." \
+            ffmpeg-rs-*
