@@ -225,6 +225,60 @@ fn a_phone_video_is_made_again_by_the_system_and_turned_upright() {
 }
 
 #[test]
+fn a_camcorders_picture_is_the_systems_and_its_sound_the_builds() {
+    // Where the build has no H.264 of its own and the system has: the
+    // picture is the system's to decode and the AC-3 the build's, which a
+    // Windows without Dolby's decoder, as GitHub's runner, has no other for.
+    if built_with("h264") || !system_decodes(&["h264"]) {
+        eprintln!("the build decodes H.264, or the system doesn't: not tested");
+        return;
+    }
+    let path = scratch("camcorder.mp4");
+    let output = render(&[
+        "--input",
+        &fixture("h264.mts"),
+        "--output",
+        &path,
+        "--video",
+        "transcode",
+        "--audio",
+        "transcode",
+        "--encoder",
+        "vp9",
+        "--max-size",
+        "320",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(&path).expect("the file is there");
+    assert!(has(&bytes, "vp09") && has(&bytes, "Opus"));
+    let _ = std::fs::remove_file(&path);
+    // And streamed so, from a time on.
+    let streamed = stream(&[
+        "--input",
+        &fixture("h264.mts"),
+        "--video",
+        "transcode",
+        "--audio",
+        "transcode",
+        "--encoder",
+        "vp9",
+        "--start",
+        "500",
+    ]);
+    assert!(
+        streamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&streamed.stderr)
+    );
+    assert!(has(&streamed.stdout, "moof") && has(&streamed.stdout, "vp09"));
+    assert!(has(&streamed.stdout, "Opus"));
+}
+
+#[test]
 fn a_frame_is_square_fitted_and_deinterlaced() {
     let frame = |id: u64, name: &str| serde_json::json!({ "op": "frame", "id": id, "path": fixture(name), "at": 0.5, "size": 512 });
     let replies = serve(&[
