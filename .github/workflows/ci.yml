@@ -1,7 +1,9 @@
 # Builds and tests the program with the free group alone and with every
 # group, so that neither rots while the other is the one used. A tag v*
 # releases the free build alone, with its notices: no build with a codec
-# under patent is given out.
+# under patent is given out. The tag builds nothing of its own: it releases
+# what main's run of the same commit built and tested, so a release is the
+# program that passed, and a commit is built once.
 name: CI
 
 on:
@@ -15,6 +17,7 @@ permissions:
 
 jobs:
   build:
+    if: github.ref_type != 'tag'
     name: build (${{ matrix.name }})
     runs-on: windows-latest
     strategy:
@@ -63,14 +66,36 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # To find main's run of the commit and download what it built.
+      actions: read
     steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: free
+      # main's run of the tagged commit, waited for where it's still going
+      # (a tag pushed with main starts its run at the same time), and its
+      # free build; a commit main hasn't run, or whose run failed, isn't
+      # released.
+      - name: Take main's build of the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 18); do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --branch main --event push --commit "$GITHUB_SHA" --limit 1 \
+              --json databaseId --jq '.[0].databaseId')
+            [ -n "$run" ] && break
+            sleep 10
+          done
+          if [ -z "$run" ]; then
+            echo "::error::$GITHUB_SHA has no run on main: push main, then the tag"
+            exit 1
+          fi
+          if ! gh run watch "$run" --repo "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null; then
+            echo "::error::main's run $run of $GITHUB_SHA didn't pass"
+            exit 1
+          fi
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name free
       - name: Release the free build
         env:
           GH_TOKEN: ${{ github.token }}
