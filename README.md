@@ -42,11 +42,11 @@ ffmpeg is built static with `--disable-everything` and only what the groups name
 
 ## Building
 
-On Windows, in [MSYS2](https://www.msys2.org)'s MINGW64 shell, with:
+On Windows, in [MSYS2](https://www.msys2.org)'s UCRT64 shell, with:
 
 ```
-pacman -S --needed make diffutils git mingw-w64-x86_64-toolchain mingw-w64-x86_64-nasm \
-  mingw-w64-x86_64-pkgconf mingw-w64-x86_64-clang mingw-w64-x86_64-zlib
+pacman -S --needed make diffutils git mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-nasm \
+  mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-zlib
 rustup target add x86_64-pc-windows-gnu
 ```
 

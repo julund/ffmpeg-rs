@@ -7,8 +7,10 @@
 #   ./build.sh --with=h264,vc1  and those groups of codecs.conf
 #   ./build.sh --test           and then its tests, against that build
 #
-# On Windows it runs in MSYS2's MINGW64 shell (or bash -l with MSYSTEM set
-# to MINGW64), with the packages README.md names. What it builds of ffmpeg
+# On Windows it runs in MSYS2's UCRT64 shell (or bash -l with MSYSTEM set
+# to UCRT64), with the packages README.md names: its gcc links the program
+# against Windows' Universal C Runtime, as MSYS2 builds everything now, not
+# the old msvcrt.dll its deprecated MINGW64 has. What it builds of ffmpeg
 # is kept under target/ffmpeg/, by what went into it, and made again only
 # when that changes. It prints the path of the program it made last, beside
 # which NOTICES.txt has the licences of what's built into it.
@@ -42,9 +44,9 @@ for argument in "$@"; do
 done
 
 case "${MSYSTEM:-}" in
-MINGW64) TARGET=x86_64-pc-windows-gnu ;;
+UCRT64) TARGET=x86_64-pc-windows-gnu ;;
 *)
-	echo "Run it in MSYS2's MINGW64 shell." >&2
+	echo "Run it in MSYS2's UCRT64 shell." >&2
 	exit 2
 	;;
 esac
@@ -90,7 +92,9 @@ FFMPEG_OPTIONS=(--enable-static --disable-shared --pkg-config-flags=--static
 # Where each is built and installed, by what went into it and into those
 # it's built on, so a change to one makes only it and what's on it again.
 key() { printf '%s\n' "$@" | sha256sum | cut -c1-12; }
-LIBS_KEY=$(key "$OPUS_SHA256" "${OPUS_OPTIONS[@]}" "$VPX_SHA256" "${VPX_OPTIONS[@]}")
+# The environment's toolchain goes into it too, as what one compiler and C
+# runtime built can't be linked by another's.
+LIBS_KEY=$(key "$MSYSTEM" "$OPUS_SHA256" "${OPUS_OPTIONS[@]}" "$VPX_SHA256" "${VPX_OPTIONS[@]}")
 LIBS=$ROOT/target/ffmpeg/$TARGET/libs-$LIBS_KEY
 PREFIX=$ROOT/target/ffmpeg/$TARGET/ffmpeg-$(key "$LIBS_KEY" "$FFMPEG_SHA256" "${FFMPEG_OPTIONS[@]}")
 SOURCES=$ROOT/target/sources
@@ -206,7 +210,7 @@ crates() {
 	section "libvpx $VPX_VERSION ($VPX_URL): BSD 3-clause, and its patent grant" \
 		"$LIBS/build/libvpx/LICENSE" "$LIBS/build/libvpx/PATENTS"
 	section "Opus $OPUS_VERSION ($OPUS_URL): BSD 3-clause" "$LIBS/build/opus/COPYING"
-	section "zlib, as MSYS2's mingw-w64-x86_64-zlib has it: zlib License" \
+	section "zlib, as MSYS2's mingw-w64-ucrt-x86_64-zlib has it: zlib License" \
 		"$(dirname "$(command -v gcc)")/../share/licenses/zlib/LICENSE"
 	crates
 } >"$RELEASE/NOTICES.txt"

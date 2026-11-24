@@ -38,14 +38,15 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           # Cargo, from the step before, on the PATH as Windows has it.
           path-type: inherit
           install: >-
             make diffutils git
-            mingw-w64-x86_64-toolchain mingw-w64-x86_64-nasm
-            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-clang mingw-w64-x86_64-zlib
+            mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-zlib
       # ffmpeg and its libraries, built again only when what goes into them
       # changes; their sources, downloaded once.
       - uses: actions/cache@v6
